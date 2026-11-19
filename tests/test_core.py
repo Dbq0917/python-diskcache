@@ -1,6 +1,7 @@
 """Test diskcache.core.Cache."""
 
 import errno
+import glob
 import hashlib
 import io
 import os
@@ -19,6 +20,7 @@ from unittest import mock
 import pytest
 
 import diskcache as dc
+from diskcache.core import Disk
 
 pytestmark = pytest.mark.filterwarnings('ignore', category=dc.EmptyDirWarning)
 
@@ -1405,3 +1407,173 @@ def test_memoize_iter(cache):
     assert len(cache) == 3
     for key in cache:
         assert cache[key] == 6
+
+
+def test_disk_write_is_atomic_publish():
+    # The value file is written to a temporary name and only renamed to its
+    # final name after the data is flushed and fsynced. A crash during the
+    # write therefore never leaves a value file at its final path.
+    directory = tempfile.mkdtemp()
+    value = b'\0' * (2**15 + 1)
+
+    try:
+        with dc.Cache(directory) as cache:
+            real_open = open
+
+            def crash_on_tmp_open(path, *args, **kwargs):
+                handle = real_open(path, *args, **kwargs)
+                if str(path).endswith('.tmp'):
+                    handle.close()
+                    raise SystemExit(137)  # Simulate SIGKILL mid-write.
+                return handle
+
+            with mock.patch('diskcache.core.open', crash_on_tmp_open):
+                with pytest.raises(SystemExit):
+                    cache.set('key', value)
+
+        # No value file at a final ".val" path and no index row.
+        assert not glob.glob(
+            op.join(directory, '**', '*.val'), recursive=True
+        )
+        assert not glob.glob(
+            op.join(directory, '**', '*.tmp'), recursive=True
+        )
+
+        with dc.Cache(directory) as reopened:
+            assert reopened.get('key', default='missing') == 'missing'
+            assert len(reopened) == 0
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+def test_recover_after_crash_between_value_and_index():
+    # Simulate a hard kill after the value file has been published (rename)
+    # but before the SQLite index transaction is committed. On reopen the
+    # index must not contain the key: either the value exists with an index
+    # or there is no index at all, never an index pointing at nothing.
+    directory = tempfile.mkdtemp()
+    value = b'\0' * (2**15 + 1)
+
+    try:
+        cache = dc.Cache(directory)
+        real_replace = os.replace
+
+        def crash_after_publish(src, dst):
+            real_replace(src, dst)
+            raise SystemExit(137)  # Simulate SIGKILL before index commit.
+
+        with mock.patch('diskcache.core.os.replace', crash_after_publish):
+            with pytest.raises(SystemExit):
+                cache.set('key', value)
+
+        cache.close()
+
+        # The value file made it to disk but the index transaction did not.
+        assert len(
+            glob.glob(op.join(directory, '**', '*.val'), recursive=True)
+        ) == 1
+
+        with dc.Cache(directory) as reopened:
+            assert 'key' not in reopened
+            assert reopened.get('key', default='missing') == 'missing'
+            assert len(reopened) == 0
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+def test_recover_removes_index_without_value_file():
+    # An index row referencing a missing value file (e.g. produced by an
+    # older on-disk layout or an interrupted rename) must be dropped on
+    # reopen instead of returning empty data on a cache hit.
+    directory = tempfile.mkdtemp()
+    value = b'\0' * (2**15 + 1)
+
+    try:
+        cache = dc.Cache(directory)
+        cache.set('key', value)
+        ((rowid, filename),) = cache._sql(
+            'SELECT rowid, filename FROM Cache WHERE key = ?', ('key',)
+        ).fetchall()
+        cache._disk.remove(filename)  # Force a dangling index row.
+        assert op.exists(op.join(directory, filename)) is False
+        cache.close()
+
+        with dc.Cache(directory) as reopened:
+            assert 'key' not in reopened
+            assert reopened.get('key', default='missing') == 'missing'
+            assert len(reopened) == 0
+            assert reopened._sql(
+                'SELECT COUNT(*) FROM Cache WHERE rowid = ?', (rowid,)
+            ).fetchone()[0] == 0
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+def test_recover_removes_index_with_truncated_value_file():
+    # A size mismatch means the value file was truncated by a crash; the row
+    # must be recovered rather than returning partial or empty data.
+    directory = tempfile.mkdtemp()
+    value = b'\0' * (2**15 + 1)
+
+    try:
+        cache = dc.Cache(directory)
+        cache.set('key', value)
+        ((filename,),) = cache._sql(
+            'SELECT filename FROM Cache WHERE key = ?', ('key',)
+        ).fetchall()
+
+        full_path = op.join(directory, filename)
+        with open(full_path, 'wb') as writer:
+            writer.write(b'')  # Truncate the value file to zero bytes.
+        cache.close()
+
+        with dc.Cache(directory) as reopened:
+            assert reopened.get('key', default='missing') == 'missing'
+            assert 'key' not in reopened
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+def test_recover_cleans_temp_files():
+    # A crash before the rename leaves a .tmp file behind. Recovery removes
+    # the unreachable temporary files while keeping intact entries readable.
+    directory = tempfile.mkdtemp()
+    value = b'\0' * (2**15 + 1)
+
+    try:
+        cache = dc.Cache(directory)
+        cache.set('good', value)
+
+        sub_dirs = glob.glob(op.join(directory, '??', '??'))
+        tmp_path = op.join(sub_dirs[0], '.abandoned.val.tmp')
+        with open(tmp_path, 'wb') as writer:
+            writer.write(b'partial')
+        cache.close()
+
+        with dc.Cache(directory) as reopened:
+            assert not op.exists(tmp_path)
+            assert reopened['good'] == value
+            assert len(reopened) == 1
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+def test_set_does_not_double_write_value_file():
+    # The durability fix must not double the number of value-file writes:
+    # one set still produces exactly one value-file write and one index row.
+    with dc.Cache() as cache:
+        value = b'\0' * (2**15 + 1)
+        real_write = Disk._write
+        writes = []
+
+        def counting_write(self, full_path, iterator, mode, encoding=None):
+            writes.append(full_path)
+            return real_write(self, full_path, iterator, mode, encoding)
+
+        with mock.patch.object(Disk, '_write', counting_write):
+            assert cache.set('key', value) is True
+
+        assert len(writes) == 1
+        assert len(cache) == 1
+        assert cache['key'] == value
+        shutil.rmtree(cache.directory, ignore_errors=True)

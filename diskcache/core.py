@@ -228,7 +228,8 @@ class Disk:
                 return len(result), MODE_PICKLE, filename, None
 
     def _write(self, full_path, iterator, mode, encoding=None):
-        full_dir, _ = op.split(full_path)
+        full_dir, name = op.split(full_path)
+        tmp_path = op.join(full_dir, '.%s.tmp' % name)
 
         for count in range(1, 11):
             with cl.suppress(OSError):
@@ -237,19 +238,46 @@ class Disk:
             try:
                 # Another cache may have deleted the directory before
                 # the file could be opened.
-                writer = open(full_path, mode, encoding=encoding)
+                writer = open(tmp_path, mode, encoding=encoding)
             except OSError:
                 if count == 10:
                     # Give up after 10 tries to open the file.
                     raise
                 continue
 
-            with writer:
-                size = 0
-                for chunk in iterator:
-                    size += len(chunk)
-                    writer.write(chunk)
+            try:
+                with writer:
+                    size = 0
+                    for chunk in iterator:
+                        size += len(chunk)
+                        writer.write(chunk)
+                    # Flush the data to disk before publishing the file so
+                    # that the value can never be missing or empty once an
+                    # index row points at it, even after a hard crash.
+                    writer.flush()
+                    os.fsync(writer.fileno())
+                # Atomic publish: the final filename appears only after the
+                # complete value file is durable. A crash leaves either no
+                # index row or a fully written value file, never an index row
+                # pointing at a missing or truncated file.
+                os.replace(tmp_path, full_path)
+                self._fsync_dir(full_dir)
                 return size
+            except BaseException:
+                with cl.suppress(OSError):
+                    os.remove(tmp_path)
+                raise
+
+    @staticmethod
+    def _fsync_dir(full_dir):
+        # fsync the directory so the rename entry is persisted. Not all
+        # platforms support opening directories this way (e.g. Windows).
+        with cl.suppress(OSError):
+            dir_fd = os.open(full_dir, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
 
     def fetch(self, mode, filename, value, read):
         """Convert fields `mode`, `filename`, and `value` from Cache table to
@@ -584,11 +612,67 @@ class Cache:
         else:
             self.drop_tag_index()
 
+        # Recover from a crash that may have left an index row pointing at a
+        # value file which was never fully written (or never written at all).
+        # Such rows are removed so lookups report a miss instead of returning
+        # empty data.
+        self._recover()
+
         # Close and re-open database connection with given timeout.
 
         self.close()
         self._timeout = timeout
         self._sql  # pylint: disable=pointless-statement
+
+    def _recover(self):
+        """Remove Cache rows whose value files did not survive a crash.
+
+        Value files are written atomically: data is flushed and fsynced to a
+        temporary file which is then renamed to its final name before the
+        index row is committed. A hard crash can therefore only leave two
+        kinds of debris:
+
+        * an index row whose referenced file is missing or whose size does
+          not match (the rename never happened or the write was truncated);
+        * a leftover ``.tmp`` value file whose index row was never written.
+
+        The dangling rows are deleted so that subsequent lookups miss rather
+        than return empty data, and the temporary files are removed.
+
+        """
+        directory = self._directory
+
+        with self._transact(retry=True) as (sql, _):
+            rows = sql(
+                'SELECT rowid, size, filename FROM Cache'
+                ' WHERE filename IS NOT NULL'
+            ).fetchall()
+
+            dangling = []
+
+            for rowid, size, filename in rows:
+                full_path = op.join(directory, filename)
+                try:
+                    real_size = op.getsize(full_path)
+                except OSError as error:
+                    if error.errno != errno.ENOENT:
+                        raise
+                    dangling.append((rowid, filename))
+                else:
+                    if real_size != size:
+                        dangling.append((rowid, filename))
+
+            for rowid, filename in dangling:
+                sql('DELETE FROM Cache WHERE rowid = ?', (rowid,))
+                self._disk.remove(filename)
+
+        # Best-effort cleanup of leftover temporary value files. These are
+        # unreachable from the index and only consume space.
+        for dirpath, _, files in os.walk(directory):
+            for name in files:
+                if name.endswith('.val.tmp'):
+                    with cl.suppress(OSError):
+                        os.remove(op.join(dirpath, name))
 
     @property
     def directory(self):
