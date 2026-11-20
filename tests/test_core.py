@@ -1405,3 +1405,144 @@ def test_memoize_iter(cache):
     assert len(cache) == 3
     for key in cache:
         assert cache[key] == 6
+
+
+def _concurrent_same_key_writer(directory, worker_id, barrier):
+    # Two schedules of the same task: each process writes the shared key once.
+    cache = dc.Cache(directory)
+    barrier.wait()
+    # Larger than disk_min_file_size so the value is stored in a .val file.
+    cache.set('shared-key', (chr(ord('A') + worker_id) * 2**18).encode())
+    cache.close()
+
+
+def _count_val_files(directory):
+    count = 0
+    for _dirpath, _dirnames, filenames in os.walk(directory):
+        count += sum(1 for name in filenames if name.endswith('.val'))
+    return count
+
+
+def test_concurrent_set_same_key_single_file():
+    import multiprocessing as mp
+
+    directory = tempfile.mkdtemp()
+    ctx = mp.get_context('spawn')
+    barrier = ctx.Barrier(2)
+    processes = [
+        ctx.Process(
+            target=_concurrent_same_key_writer,
+            args=(directory, worker_id, barrier),
+        )
+        for worker_id in range(2)
+    ]
+
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join()
+
+    assert [process.exitcode for process in processes] == [0, 0]
+
+    with dc.Cache(directory) as cache:
+        indexed = cache._con.execute(
+            'SELECT COUNT(*) FROM Cache WHERE filename IS NOT NULL'
+        ).fetchone()[0]
+        assert indexed == 1
+        assert _count_val_files(directory) == 1
+        assert len(cache.check()) == 0
+        assert cache.get('shared-key') is not None
+
+    shutil.rmtree(directory, ignore_errors=True)
+
+
+def test_orphan_files_reclaimed_on_open():
+    directory = tempfile.mkdtemp()
+
+    # Establish a healthy, indexed item first.
+    with dc.Cache(directory) as cache:
+        cache.set('indexed-key', b'x' * 2**18)
+        indexed_path = op.join(
+            directory,
+            cache._con.execute(
+                'SELECT filename FROM Cache WHERE filename IS NOT NULL'
+            ).fetchone()[0],
+        )
+        # Simulate a writer that stored a value file but never committed the
+        # index row (for example because it was killed mid-write).
+        _orphan_name, orphan_path = cache._disk.filename()
+        cache._disk._write(
+            orphan_path, io.BytesIO(b'orphan' * 2**16), 'xb'
+        )
+
+    assert _count_val_files(directory) == 2
+
+    # Reopening the cache reclaims the orphan but keeps the indexed file.
+    with dc.Cache(directory) as cache:
+        assert _count_val_files(directory) == 1
+        assert op.exists(indexed_path)
+        assert not op.exists(orphan_path)
+        assert cache.get('indexed-key') == b'x' * 2**18
+        assert len(cache.check()) == 0
+
+    shutil.rmtree(directory, ignore_errors=True)
+
+
+def test_nested_transaction_rollback_reclaims_value_file():
+    directory = tempfile.mkdtemp()
+
+    with dc.Cache(directory) as cache:
+        cache.set('key', b'a' * 2**18)
+        original = cache._row_update
+        attempts = {'count': 0}
+
+        def failing_row_update(rowid, now, columns):
+            attempts['count'] += 1
+            if attempts['count'] == 1:
+                raise RuntimeError('simulated nested failure')
+            return original(rowid, now, columns)
+
+        cache._row_update = failing_row_update
+
+        with pytest.raises(RuntimeError):
+            # `set` joins the surrounding transaction as a nested txn.
+            with cache.transact():
+                cache.set('key', b'b' * 2**18)
+
+        cache._row_update = original
+        assert _count_val_files(directory) == 1
+        assert len(cache.check()) == 0
+        assert cache.get('key') == b'a' * 2**18
+
+    shutil.rmtree(directory, ignore_errors=True)
+
+
+def test_rolled_back_transaction_reclaims_value_file():
+    directory = tempfile.mkdtemp()
+
+    with dc.Cache(directory) as cache:
+        cache.set('key', b'a' * 2**18)
+        original = cache._row_update
+        attempts = {'count': 0}
+
+        def failing_row_update(rowid, now, columns):
+            attempts['count'] += 1
+            if attempts['count'] == 1:
+                raise RuntimeError('simulated transaction failure')
+            return original(rowid, now, columns)
+
+        cache._row_update = failing_row_update
+
+        with pytest.raises(RuntimeError):
+            cache.set('key', b'b' * 2**18)
+
+        cache._row_update = original
+        assert _count_val_files(directory) == 1
+        assert len(cache.check()) == 0
+
+        # The cache remains usable and the old value is still readable.
+        cache.set('key', b'c' * 2**18)
+        assert cache.get('key') == b'c' * 2**18
+        assert _count_val_files(directory) == 1
+
+    shutil.rmtree(directory, ignore_errors=True)

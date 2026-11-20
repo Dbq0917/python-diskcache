@@ -440,6 +440,9 @@ class Cache:
         self._directory = directory
         self._timeout = 0  # Manually handle retries during initialization.
         self._local = threading.local()
+        # Stack of value files created by the active (possibly nested)
+        # transaction in each thread. Used to reclaim orphans on rollback.
+        self._local.created = []
         self._txn_id = None
 
         if not op.isdir(directory):
@@ -590,6 +593,77 @@ class Cache:
         self._timeout = timeout
         self._sql  # pylint: disable=pointless-statement
 
+        # Reclaim value files left behind by a writer that crashed (for
+        # example a scheduled task killed mid-write) or whose transaction was
+        # rolled back. Such files are not referenced by any index row and are
+        # therefore unreachable but still consume disk space.
+        self._recover_orphan_files()
+
+    def _recover_orphan_files(self):
+        """Remove value files on disk that no Cache row references.
+
+        A write first stores the value in its own file and then updates the
+        index inside a transaction. If the writer process is killed before
+        the transaction commits, or the transaction is rolled back, the value
+        file remains on disk but nothing ever points at it. Sweep the cache
+        directory and remove those orphan files.
+
+        Recovery only runs while opening the cache, not on every write, so
+        the common write path keeps its latency. A cheap count comparison
+        skips the directory walk entirely when no orphan can exist. It is
+        safe to run while other processes hold the cache open: only files
+        absent from the committed index are deleted.
+
+        """
+        sql = self._sql
+        indexed = {
+            row[0]
+            for row in sql(
+                'SELECT filename FROM Cache WHERE filename IS NOT NULL'
+            ).fetchall()
+        }
+
+        on_disk = 0
+        for _dirpath, _dirnames, filenames in os.walk(self._directory):
+            on_disk += sum(
+                1 for name in filenames if name.endswith('.val')
+            )
+
+        # Every indexed value maps to exactly one file, so equal counts mean
+        # the files on disk are exactly the referenced files.
+        if on_disk == len(indexed):
+            return
+
+        indexed_paths = {
+            op.join(self._directory, filename) for filename in indexed
+        }
+
+        for dirpath, _dirnames, files in os.walk(self._directory):
+            for name in files:
+                if not name.endswith('.val'):
+                    continue
+                full_path = op.join(dirpath, name)
+                if full_path not in indexed_paths:
+                    self._disk.remove(
+                        op.relpath(full_path, self._directory)
+                    )
+
+        # Repeatedly remove empty shard directories, deepest first, so that
+        # parents are removed once their children are gone. The loop also
+        # converges against directories that concurrent writers create or
+        # empty while the sweep is running.
+        for _ in range(3):
+            empty_dirs = [
+                dirpath
+                for dirpath, dirnames, files in os.walk(self._directory)
+                if not dirnames and not files
+            ]
+            if not empty_dirs:
+                break
+            for dirpath in reversed(empty_dirs):
+                with cl.suppress(OSError):
+                    os.removedirs(dirpath)
+
     @property
     def directory(self):
         """Cache directory."""
@@ -716,6 +790,9 @@ class Cache:
         if tid == txn_id:
             begin = False
         else:
+            # New outermost transaction: start a fresh stack of value files
+            # created within it so a rollback can reclaim the orphans.
+            self._local.created = []
             while True:
                 try:
                     sql('BEGIN IMMEDIATE')
@@ -729,6 +806,11 @@ class Cache:
                         _disk_remove(filename)
                     raise Timeout from None
 
+        if filename is not None:
+            # Nested transactions share the outermost stack so files they
+            # create are reclaimed when the outermost transaction rolls back.
+            self._local.created.append(filename)
+
         try:
             yield sql, filenames.append
         except BaseException:
@@ -736,12 +818,22 @@ class Cache:
                 assert self._txn_id == tid
                 self._txn_id = None
                 sql('ROLLBACK')
+                # The outermost transaction rolled back so none of the index
+                # updates were committed. Value files written during the
+                # transaction (including by nested transactions) are
+                # unreachable from the index and must be reclaimed. Files
+                # queued in `filenames` are superseded values still
+                # referenced by their original index rows, so they are kept.
+                for name in self._local.created:
+                    _disk_remove(name)
+                self._local.created = []
             raise
         else:
             if begin:
                 assert self._txn_id == tid
                 self._txn_id = None
                 sql('COMMIT')
+                self._local.created = []
             for name in filenames:
                 if name is not None:
                     _disk_remove(name)
