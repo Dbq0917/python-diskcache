@@ -256,6 +256,108 @@ def test_read_keyerror(cache):
             pass
 
 
+def test_expire_does_not_truncate_active_read(cache):
+    value = b'0123456789' * 2**18
+    assert cache.set('key', value, expire=60)
+
+    half_read = threading.Event()
+    resume = threading.Event()
+    filename = []
+    result = []
+    errors = []
+
+    def read_value():
+        try:
+            with cache.read('key') as reader:
+                filename.append(reader.name)
+                first = reader.read(len(value) // 2)
+                half_read.set()
+                assert resume.wait(5)
+                result.append(first + reader.read())
+        except BaseException as error:  # pylint: disable=broad-except
+            errors.append(error)
+
+    real_remove = os.remove
+
+    def truncating_remove(path):
+        with open(path, 'r+b') as writer:
+            writer.truncate(0)
+        real_remove(path)
+
+    thread = threading.Thread(target=read_value)
+
+    with mock.patch('diskcache.core.os.remove', truncating_remove):
+        thread.start()
+
+        try:
+            assert half_read.wait(5)
+            assert cache.expire(now=time.time() + 61) == 1
+
+            assert op.exists(filename[0])
+        finally:
+            resume.set()
+            thread.join()
+
+    assert not errors
+    assert result == [value]
+    assert not op.exists(filename[0])
+    assert cache.check() == []
+
+
+def test_deferred_removals_drain_after_reads(cache):
+    handles = []
+    paths = []
+
+    try:
+        for key in range(10):
+            cache.set(key, b'x' * (cache.disk_min_file_size + 1), expire=60)
+            ((filename,),) = cache._sql(
+                'SELECT filename FROM Cache WHERE key = ?', (key,)
+            ).fetchall()
+            paths.append(op.join(cache.directory, filename))
+            handles.append(cache.read(key))
+
+        assert cache.expire(now=time.time() + 61) == len(paths)
+        assert all(path in dc.Disk._deferred_removals for path in paths)
+
+        before = len(dc.Disk._deferred_removals)
+        assert cache.expire(now=time.time() + 61) == 0
+        assert len(dc.Disk._deferred_removals) == before
+
+        handles.pop().close()
+        assert len(dc.Disk._deferred_removals) == before - 1
+    finally:
+        for handle in handles:
+            handle.close()
+
+    assert all(path not in dc.Disk._deferred_removals for path in paths)
+    assert all(not op.exists(path) for path in paths)
+    assert cache.check() == []
+
+
+def test_deferred_removal_waits_for_all_readers(cache):
+    value = b'x' * (cache.disk_min_file_size + 1)
+    assert cache.set('key', value, expire=60)
+    ((filename,),) = cache._sql(
+        'SELECT filename FROM Cache WHERE key = ?', ('key',)
+    ).fetchall()
+    full_path = op.join(cache.directory, filename)
+
+    first = cache.read('key')
+    second = cache.read('key')
+
+    assert cache.expire(now=time.time() + 61) == 1
+    assert full_path in dc.Disk._deferred_removals
+
+    first.close()
+    assert op.exists(full_path)
+
+    second.close()
+    assert not op.exists(full_path)
+    assert full_path not in dc.Disk._deferred_removals
+    assert cache.check() == []
+
+
 def test_set_twice(cache):
     large_value = b'abcd' * 2**20
 

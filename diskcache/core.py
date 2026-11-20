@@ -17,6 +17,7 @@ import tempfile
 import threading
 import time
 import warnings
+import weakref
 import zlib
 
 
@@ -102,6 +103,10 @@ EVICTION_POLICY = {
 
 class Disk:
     """Cache key and value serialization for SQLite database and files."""
+
+    _reader_lock = threading.Lock()
+    _reader_counts = {}
+    _deferred_removals = set()
 
     def __init__(self, directory, min_file_size=0, pickle_protocol=0):
         """Initialize disk instance.
@@ -268,20 +273,86 @@ class Disk:
             return bytes(value) if type(value) is sqlite3.Binary else value
         elif mode == MODE_BINARY:
             if read:
-                return open(op.join(self._directory, filename), 'rb')
+                return self._open(filename, 'rb')
             else:
-                with open(op.join(self._directory, filename), 'rb') as reader:
+                with self._open(filename, 'rb') as reader:
                     return reader.read()
         elif mode == MODE_TEXT:
-            full_path = op.join(self._directory, filename)
-            with open(full_path, 'r', encoding='UTF-8') as reader:
+            with self._open(filename, 'r', encoding='UTF-8') as reader:
                 return reader.read()
         elif mode == MODE_PICKLE:
             if value is None:
-                with open(op.join(self._directory, filename), 'rb') as reader:
+                with self._open(filename, 'rb') as reader:
                     return pickle.load(reader)
             else:
                 return pickle.load(io.BytesIO(value))
+
+    def _open(self, filename, mode, encoding=None):
+        full_path = op.join(self._directory, filename)
+        self._reader_start(full_path)
+
+        try:
+            kwargs = {} if encoding is None else {'encoding': encoding}
+            reader = open(full_path, mode, **kwargs)
+        except BaseException:
+            self._reader_stop(full_path)
+            raise
+
+        close_method = type(reader).close
+        reader_ref = weakref.ref(reader)
+        close_lock = threading.Lock()
+        closed = [False]
+
+        def close():
+            with close_lock:
+                if closed[0]:
+                    return
+
+                closed[0] = True
+                value = reader_ref()
+
+            try:
+                if value is not None:
+                    close_method(value)
+            finally:
+                self._reader_stop(full_path)
+
+        try:
+            reader.close = close
+        except BaseException:
+            reader.close()
+            self._reader_stop(full_path)
+            raise
+
+        return reader
+
+    def _reader_start(self, full_path):
+        with self._reader_lock:
+            if full_path in self._deferred_removals:
+                raise IOError(
+                    errno.ENOENT, 'file is being removed', full_path
+                )
+
+            count = self._reader_counts.get(full_path, 0)
+            self._reader_counts[full_path] = count + 1
+
+    def _reader_stop(self, full_path):
+        remove = False
+
+        with self._reader_lock:
+            count = self._reader_counts.get(full_path)
+
+            if not count:
+                return
+
+            if count > 1:
+                self._reader_counts[full_path] = count - 1
+            else:
+                del self._reader_counts[full_path]
+                remove = full_path in self._deferred_removals
+
+        if remove:
+            self._remove_deferred(full_path)
 
     def filename(self, key=UNKNOWN, value=UNKNOWN):
         """Return filename and full-path tuple for file storage.
@@ -312,13 +383,35 @@ class Disk:
     def remove(self, file_path):
         """Remove a file given by `file_path`.
 
-        This method is cross-thread and cross-process safe. If an OSError
-        occurs, it is suppressed.
+        If the file is being read, removal is deferred until the last reader
+        closes. This method is cross-thread and cross-process safe. If an
+        OSError occurs, it is suppressed.
 
         :param str file_path: relative path to file
 
         """
         full_path = op.join(self._directory, file_path)
+
+        with self._reader_lock:
+            if full_path in self._deferred_removals:
+                return
+
+            self._deferred_removals.add(full_path)
+
+            if self._reader_counts.get(full_path):
+                return
+
+        self._remove_deferred(full_path)
+
+    def _remove_deferred(self, full_path):
+        try:
+            self._remove_file(full_path)
+        finally:
+            with self._reader_lock:
+                self._deferred_removals.discard(full_path)
+
+    @staticmethod
+    def _remove_file(full_path):
         full_dir, _ = op.split(full_path)
 
         # Suppress OSError that may occur if two caches attempt to delete the
@@ -1974,7 +2067,8 @@ class Cache:
                         warnings.warn(message, UnknownFileWarning)
 
                         if fix:
-                            os.remove(full_path)
+                            filename = op.relpath(full_path, self._directory)
+                            self._disk.remove(filename)
 
                 # Check for empty directories.
 
