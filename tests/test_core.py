@@ -3,6 +3,7 @@
 import errno
 import hashlib
 import io
+import multiprocessing as mp
 import os
 import os.path as op
 import pathlib
@@ -336,6 +337,144 @@ def test_get_ioerror_fast_path(cache):
 
     with mock.patch.object(cache, '_disk', disk):
         assert cache.get(0) is None
+
+
+def test_get_ioerror_retry_fast_path(cache):
+    size = cache.disk_min_file_size + 1
+    assert cache.set('key', b'a' * size)
+
+    other = dc.Cache(cache.directory)
+    original_fetch = dc.Disk.fetch
+    calls = []
+
+    def fetch_with_update(self, mode, filename, value, read):
+        if not calls:
+            calls.append(filename)
+            # Simulate another process updating the key after this process
+            # selected the row but before it read the value file.
+            other.set('key', b'b' * size)
+            error = IOError()
+            error.errno = errno.ENOENT
+            raise error
+        return original_fetch(self, mode, filename, value, read)
+
+    try:
+        with mock.patch.object(dc.Disk, 'fetch', fetch_with_update):
+            assert cache.get('key') == b'b' * size
+    finally:
+        other.close()
+
+    assert len(calls) == 1
+    assert cache.check() == []
+
+
+def test_get_ioerror_retry_slow_path():
+    with dc.Cache(statistics=1) as cache:
+        size = cache.disk_min_file_size + 1
+        assert cache.set('key', b'a' * size)
+
+        disk = mock.Mock(wraps=cache._disk)
+        fetch = mock.Mock()
+        io_error = IOError()
+        io_error.errno = errno.ENOENT
+        fetch.side_effect = io_error
+        disk.fetch = fetch
+
+        with mock.patch.object(cache, '_disk', disk):
+            assert cache.get('key', 'default') == 'default'
+
+        assert fetch.call_count == 10
+    shutil.rmtree(cache.directory, ignore_errors=True)
+
+
+def test_get_missing_file(cache):
+    size = cache.disk_min_file_size + 1
+    assert cache.set('key', b'a' * size)
+
+    ((filename,),) = cache._sql(
+        'SELECT filename FROM Cache WHERE key = ?', ('key',)
+    ).fetchall()
+    os.remove(op.join(cache.directory, filename))
+
+    assert cache.get('key', 'default') == 'default'
+
+
+def _mp_writer(directory, keys, rounds, start):
+    cache = dc.Cache(directory)
+    start.wait()
+    for num in range(rounds):
+        for key in keys:
+            cache[key] = 'writer-%d-' % num + 'x' * 40000
+    cache.close()
+
+
+def _mp_reader(directory, keys, rounds, start, done, queue):
+    cache = dc.Cache(directory)
+    start.wait()
+    misses = 0
+    for _ in range(rounds):
+        for key in keys:
+            if cache.get(key, 'MISSING') == 'MISSING':
+                misses += 1
+    assert done.wait(60)
+    digest = hashlib.sha256()
+    for key in keys:
+        value = cache.get(key, 'MISSING')
+        assert value.startswith('writer-')
+        digest.update(value.encode('utf-8'))
+    cache.close()
+    queue.put((misses, digest.hexdigest()))
+
+
+def test_get_multiprocess_visibility():
+    directory = tempfile.mkdtemp()
+    keys = ['key-%d' % num for num in range(20)]
+    rounds = 100
+
+    try:
+        cache = dc.Cache(directory)
+        for key in keys:
+            cache[key] = 'init-' + 'x' * 40000
+        cache.close()
+
+        start = mp.Event()
+        done = mp.Event()
+        queue = mp.Queue()
+        writers = [
+            mp.Process(
+                target=_mp_writer, args=(directory, keys, rounds, start)
+            )
+            for _ in range(2)
+        ]
+        readers = [
+            mp.Process(
+                target=_mp_reader,
+                args=(directory, keys, rounds, start, done, queue),
+            )
+            for _ in range(2)
+        ]
+
+        for proc in writers + readers:
+            proc.start()
+        start.set()
+        for proc in writers:
+            proc.join()
+        done.set()
+        results = [queue.get() for _ in readers]
+        for proc in readers:
+            proc.join()
+            assert proc.exitcode == 0
+
+        misses, digests = zip(*results)
+
+        # Keys are never deleted so every read must observe a value.
+        assert misses == (0, 0)
+
+        # Both processes read the same batch of keys after the writers
+        # finished so the observed values must agree.
+        assert digests[0] == digests[1]
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
 
 
 def test_get_expired_slow_path(cache):

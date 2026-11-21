@@ -1162,17 +1162,33 @@ class Cache:
         if not self.statistics and update_column is None:
             # Fast path, no transaction necessary.
 
-            rows = self._sql(select, (db_key, raw, time.time())).fetchall()
+            # Another process may update or delete the key between the
+            # SELECT and the file read below. Retry so that concurrent
+            # writes are observed rather than reported as misses. The
+            # number of attempts is bounded so that a genuinely missing
+            # value file still results in `default`.
 
-            if not rows:
-                return default
+            for _ in range(10):
+                rows = self._sql(select, (db_key, raw, time.time())).fetchall()
 
-            ((rowid, db_expire_time, db_tag, mode, filename, db_value),) = rows
+                if not rows:
+                    return default
 
-            try:
-                value = self._disk.fetch(mode, filename, db_value, read)
-            except IOError:
-                # Key was deleted before we could retrieve result.
+                (
+                    (rowid, db_expire_time, db_tag, mode, filename, db_value),
+                ) = rows
+
+                try:
+                    value = self._disk.fetch(mode, filename, db_value, read)
+                except IOError:
+                    # Key was updated or deleted by another process before
+                    # we could retrieve the result. Re-select to observe
+                    # the latest row.
+                    continue
+
+                break
+            else:
+                # Value file is missing though the cache row remains.
                 return default
 
         else:  # Slow path, transaction required.
@@ -1183,34 +1199,52 @@ class Cache:
                 'UPDATE Settings SET value = value + 1 WHERE key = "misses"'
             )
 
-            with self._transact(retry) as (sql, _):
-                rows = sql(select, (db_key, raw, time.time())).fetchall()
+            # Like the fast path above, retry when another process updates
+            # or deletes the key between the SELECT and the file read.
 
-                if not rows:
+            for _ in range(10):
+                with self._transact(retry) as (sql, _):
+                    rows = sql(select, (db_key, raw, time.time())).fetchall()
+
+                    if not rows:
+                        if self.statistics:
+                            sql(cache_miss)
+                        return default
+
+                    (
+                        (
+                            rowid,
+                            db_expire_time,
+                            db_tag,
+                            mode,
+                            filename,
+                            db_value,
+                        ),
+                    ) = rows
+
+                    try:
+                        value = self._disk.fetch(
+                            mode, filename, db_value, read
+                        )
+                    except IOError:
+                        # Key was updated or deleted by another process
+                        # before we could retrieve the result. Retry the
+                        # transaction to observe the latest row.
+                        continue
+
                     if self.statistics:
-                        sql(cache_miss)
-                    return default
+                        sql(cache_hit)
 
-                (
-                    (rowid, db_expire_time, db_tag, mode, filename, db_value),
-                ) = rows  # noqa: E127
+                    now = time.time()
+                    update = 'UPDATE Cache SET %s WHERE rowid = ?'
 
-                try:
-                    value = self._disk.fetch(mode, filename, db_value, read)
-                except IOError:
-                    # Key was deleted before we could retrieve result.
-                    if self.statistics:
-                        sql(cache_miss)
-                    return default
+                    if update_column is not None:
+                        sql(update % update_column.format(now=now), (rowid,))
 
-                if self.statistics:
-                    sql(cache_hit)
-
-                now = time.time()
-                update = 'UPDATE Cache SET %s WHERE rowid = ?'
-
-                if update_column is not None:
-                    sql(update % update_column.format(now=now), (rowid,))
+                break
+            else:
+                # Value file is missing though the cache row remains.
+                return default
 
         if expire_time and tag:
             return (value, db_expire_time, db_tag)
